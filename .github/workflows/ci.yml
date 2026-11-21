@@ -9,8 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  shellcheck:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck -S warning $(git ls-files '*.sh' '*.bash')
+      - run: shellcheck -S warning install.sh airglass
+      - run: python3 -m py_compile airglass-hid

@@ -2,6 +2,7 @@
 Description=airglass AirPlay mirroring receiver
 After=graphical-session.target pipewire.service
 PartOf=graphical-session.target
+Wants=airglass-hid.service
 
 [Service]
 Type=simple

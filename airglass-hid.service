@@ -1,0 +1,12 @@
+[Unit]
+Description=airglass phone control (Bluetooth LE mouse + keyboard)
+PartOf=airglass.service
+After=airglass.service
+
+[Service]
+Type=notify
+ExecStart=@HID@
+Restart=on-failure
+RestartSec=3
+# If the loop ever stalls while input is grabbed, systemd kills it and the grab goes away.
+WatchdogSec=6

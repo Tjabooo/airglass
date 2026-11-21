@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+"""airglass-hid: control the mirrored phone with this computer's mouse and keyboard.
+
+The computer presents itself to the phone as a Bluetooth LE mouse + keyboard (HID over
+GATT, through BlueZ's D-Bus API; no root needed). Click inside the mirror window to hand
+your mouse and keyboard to the phone; press the release key (Right Ctrl) to take them back.
+
+iPhone: Settings > Accessibility > Touch > AssistiveTouch must be on for the pointer.
+Pair once with `airglass pair`, then pick the computer under Settings > Bluetooth.
+"""
+import fcntl
+import json
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+import dbus
+import dbus.exceptions
+import dbus.mainloop.glib
+import dbus.service
+import evdev
+from evdev import ecodes as E
+from gi.repository import GLib
+
+try:
+    from gi.repository import GLibUnix
+    signal_add = GLibUnix.signal_add
+except ImportError:
+    signal_add = GLib.unix_signal_add
+
+BLUEZ = "org.bluez"
+DBUS_OM = "org.freedesktop.DBus.ObjectManager"
+DBUS_PROP = "org.freedesktop.DBus.Properties"
+ADAPTER = "org.bluez.Adapter1"
+DEVICE = "org.bluez.Device1"
+GATT_MANAGER = "org.bluez.GattManager1"
+GATT_SERVICE = "org.bluez.GattService1"
+GATT_CHRC = "org.bluez.GattCharacteristic1"
+GATT_DESC = "org.bluez.GattDescriptor1"
+AD_MANAGER = "org.bluez.LEAdvertisingManager1"
+AD_IFACE = "org.bluez.LEAdvertisement1"
+AGENT_MANAGER = "org.bluez.AgentManager1"
+AGENT_IFACE = "org.bluez.Agent1"
+
+APP_PATH = "/io/airglass/hid"
+AD_PATH = "/io/airglass/adv"
+AGENT_PATH = "/io/airglass/agent"
+PAIR_SECONDS = 120
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "airglass")
+
+
+def log(*a):
+    print("airglass-hid:", *a, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- config
+def load_config():
+    cfg = {
+        "CONTROL": "yes",
+        "RELEASE_KEY": "KEY_RIGHTCTRL",
+        "SENSITIVITY": "1.0",
+        "SCROLL_INVERT": "no",
+        "REPORT_INTERVAL_MS": "8",
+        "MIRROR_CLASS": "^(uxplay|airglass)$",
+        "NOTIFY": "yes",
+    }
+    path = os.environ.get("AIRGLASS_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "airglass", "config")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.split("#", 1)[0].strip().strip('"')
+                cfg[k.strip()] = v
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def yes(v):
+    return str(v).lower() in ("yes", "true", "on", "1")
+
+
+CFG = load_config()
+
+
+def notify(title, body="", urgency="normal"):
+    if not yes(CFG["NOTIFY"]):
+        return
+    try:
+        proc = subprocess.Popen(["notify-send", "-a", "airglass", "-u", urgency, "-i", "input-mouse",
+                                 "-h", "string:x-dunst-stack-tag:airglass-hid", title, body],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        GLib.child_watch_add(GLib.PRIORITY_LOW, proc.pid, lambda *_: proc.poll())
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- HID descriptors
+REPORT_KEYBOARD, REPORT_MOUSE, REPORT_CONSUMER = 1, 2, 3
+REPORT_MAP = bytes([
+    # Keyboard, report 1: modifiers, reserved, 6 keys; LED output
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, REPORT_KEYBOARD,
+    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+    0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02,
+    0x95, 0x01, 0x75, 0x03, 0x91, 0x01,
+    0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
+    0xC0,
+    # Mouse, report 2: 5 buttons, 16-bit X/Y, wheel, horizontal pan
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, REPORT_MOUSE,
+    0x09, 0x01, 0xA1, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x03, 0x81, 0x01,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06,
+    0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+    0x05, 0x0C, 0x0A, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+    0xC0, 0xC0,
+    # Consumer control, report 3: one 16-bit usage (Home, volume, media keys)
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, REPORT_CONSUMER,
+    0x15, 0x00, 0x26, 0xFF, 0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
+    0xC0,
+])
+
+MODIFIERS = {E.KEY_LEFTCTRL: 0x01, E.KEY_LEFTSHIFT: 0x02, E.KEY_LEFTALT: 0x04, E.KEY_LEFTMETA: 0x08,
+             E.KEY_RIGHTCTRL: 0x10, E.KEY_RIGHTSHIFT: 0x20, E.KEY_RIGHTALT: 0x40, E.KEY_RIGHTMETA: 0x80}
+
+
+def _keymap():
+    m = {}
+    for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+        m[getattr(E, "KEY_" + ch)] = 0x04 + i
+    for i, d in enumerate("1234567890"):
+        m[getattr(E, "KEY_" + d)] = 0x1E + i
+    named = {
+        "ENTER": 0x28, "ESC": 0x29, "BACKSPACE": 0x2A, "TAB": 0x2B, "SPACE": 0x2C, "MINUS": 0x2D,
+        "EQUAL": 0x2E, "LEFTBRACE": 0x2F, "RIGHTBRACE": 0x30, "BACKSLASH": 0x31, "SEMICOLON": 0x33,
+        "APOSTROPHE": 0x34, "GRAVE": 0x35, "COMMA": 0x36, "DOT": 0x37, "SLASH": 0x38, "CAPSLOCK": 0x39,
+        "SYSRQ": 0x46, "SCROLLLOCK": 0x47, "PAUSE": 0x48, "INSERT": 0x49, "HOME": 0x4A, "PAGEUP": 0x4B,
+        "DELETE": 0x4C, "END": 0x4D, "PAGEDOWN": 0x4E, "RIGHT": 0x4F, "LEFT": 0x50, "DOWN": 0x51,
+        "UP": 0x52, "NUMLOCK": 0x53, "KPSLASH": 0x54, "KPASTERISK": 0x55, "KPMINUS": 0x56,
+        "KPPLUS": 0x57, "KPENTER": 0x58, "KPDOT": 0x63, "102ND": 0x64, "COMPOSE": 0x65,
+    }
+    for name, usage in named.items():
+        m[getattr(E, "KEY_" + name)] = usage
+    for i in range(12):
+        m[getattr(E, "KEY_F%d" % (i + 1))] = 0x3A + i
+    for i in range(1, 10):
+        m[getattr(E, "KEY_KP%d" % i)] = 0x58 + i
+    m[E.KEY_KP0] = 0x62
+    return m
+
+
+KEYMAP = _keymap()
+CONSUMER = {E.KEY_HOMEPAGE: 0x223, E.KEY_VOLUMEUP: 0xE9, E.KEY_VOLUMEDOWN: 0xEA, E.KEY_MUTE: 0xE2,
+            E.KEY_PLAYPAUSE: 0xCD, E.KEY_NEXTSONG: 0xB5, E.KEY_PREVIOUSSONG: 0xB6, E.KEY_STOPCD: 0xB7}
+BUTTONS = {E.BTN_LEFT: 0x01, E.BTN_RIGHT: 0x02, E.BTN_MIDDLE: 0x04, E.BTN_SIDE: 0x08, E.BTN_EXTRA: 0x10}
+
+
+# --------------------------------------------------------------------------- GATT objects
+class NotPermitted(dbus.exceptions.DBusException):
+    _dbus_error_name = "org.bluez.Error.NotPermitted"
+
+
+class Rejected(dbus.exceptions.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+
+def ay(data):
+    return dbus.Array([dbus.Byte(b) for b in data], signature="y")
+
+
+class Application(dbus.service.Object):
+    def __init__(self, bus):
+        self.bus, self.services = bus, []
+        super().__init__(bus, APP_PATH)
+
+    @dbus.service.method(DBUS_OM, out_signature="a{oa{sa{sv}}}")
+    def GetManagedObjects(self):
+        out = {}
+        for s in self.services:
+            out[s.path] = s.props()
+            for c in s.chars:
+                out[c.path] = c.props()
+                for d in c.descs:
+                    out[d.path] = d.props()
+        return out
+
+
+class Service(dbus.service.Object):
+    def __init__(self, app, uuid):
+        self.path = "%s/s%d" % (APP_PATH, len(app.services))
+        self.bus, self.uuid, self.chars = app.bus, uuid, []
+        super().__init__(self.bus, self.path)
+        app.services.append(self)
+
+    def props(self):
+        return {GATT_SERVICE: {"UUID": self.uuid, "Primary": True,
+                               "Characteristics": dbus.Array([c.path for c in self.chars], signature="o")}}
+
+    @dbus.service.method(DBUS_PROP, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return self.props()[GATT_SERVICE]
+
+
+class Characteristic(dbus.service.Object):
+    def __init__(self, service, uuid, flags, value=b"", notify=False, on_change=None, on_write=None):
+        self.path = "%s/c%d" % (service.path, len(service.chars))
+        self.service, self.uuid, self.flags, self.value = service, uuid, flags, bytes(value)
+        self.descs, self.notify = [], notify
+        self.on_change, self.on_write = on_change, on_write
+        self.sock, self.watch, self.notifying, self.device = None, None, False, None
+        self.dropped = 0
+        super().__init__(service.bus, self.path)
+        service.chars.append(self)
+
+    def props(self):
+        p = {"Service": dbus.ObjectPath(self.service.path), "UUID": self.uuid,
+             "Flags": dbus.Array(self.flags, signature="s"),
+             "Descriptors": dbus.Array([d.path for d in self.descs], signature="o")}
+        if self.notify:
+            p["NotifyAcquired"] = dbus.Boolean(self.sock is not None)
+        return {GATT_CHRC: p}
+
+    @dbus.service.method(DBUS_PROP, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return self.props()[GATT_CHRC]
+
+    @dbus.service.method(GATT_CHRC, in_signature="a{sv}", out_signature="ay")
+    def ReadValue(self, options):
+        return ay(self.value)
+
+    @dbus.service.method(GATT_CHRC, in_signature="aya{sv}")
+    def WriteValue(self, value, options):
+        self.value = bytes(value)
+        if self.on_write:
+            self.on_write(self.value)
+
+    # Notifications go over a socket BlueZ hands us (no D-Bus round trip per report).
+    @dbus.service.method(GATT_CHRC, in_signature="a{sv}", out_signature="hq")
+    def AcquireNotify(self, options):
+        device = options.get("device")
+        if not device_paired(self.service.bus, device):
+            log("refused notifications for unpaired", device)
+            raise NotPermitted("pair first (airglass pair)")
+        self.drop()
+        mine, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        mine.setblocking(False)
+        self.sock, self.device = mine, str(device)
+        self.watch = GLib.io_add_watch(mine.fileno(), GLib.PRIORITY_DEFAULT,
+                                       GLib.IO_HUP | GLib.IO_ERR | GLib.IO_IN, self._sock_event)
+        fd = dbus.types.UnixFd(theirs.fileno())
+        theirs.close()
+        if self.on_change:
+            GLib.idle_add(self.on_change)
+        return fd, dbus.UInt16(int(options.get("mtu", 23)))
+
+    def _sock_event(self, fd, cond):
+        if cond & (GLib.IO_HUP | GLib.IO_ERR):
+            self.watch = None
+            self.drop()
+            return False
+        try:
+            self.sock.recv(64)
+        except OSError:
+            pass
+        return True
+
+    def drop(self):
+        changed = self.sock is not None
+        if self.watch:
+            GLib.source_remove(self.watch)
+            self.watch = None
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+        if changed and self.on_change:
+            GLib.idle_add(self.on_change)
+
+    @dbus.service.method(GATT_CHRC)
+    def StartNotify(self):
+        self.notifying = True
+        if self.on_change:
+            GLib.idle_add(self.on_change)
+
+    @dbus.service.method(GATT_CHRC)
+    def StopNotify(self):
+        self.notifying = False
+        if self.on_change:
+            GLib.idle_add(self.on_change)
+
+    @dbus.service.signal(DBUS_PROP, signature="sa{sv}as")
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+    def subscribed(self):
+        return self.sock is not None or self.notifying
+
+    def send(self, data):
+        self.value = data
+        if self.sock:
+            try:
+                self.sock.send(data)
+            except BlockingIOError:
+                self.dropped += 1  # link is saturated: drop this report rather than queue latency
+            except OSError:
+                self.drop()
+        elif self.notifying:
+            self.PropertiesChanged(GATT_CHRC, {"Value": ay(data)}, [])
+
+
+class Descriptor(dbus.service.Object):
+    def __init__(self, chrc, uuid, value):
+        self.path = "%s/d%d" % (chrc.path, len(chrc.descs))
+        self.chrc, self.uuid, self.value = chrc, uuid, bytes(value)
+        super().__init__(chrc.service.bus, self.path)
+        chrc.descs.append(self)
+
+    def props(self):
+        return {GATT_DESC: {"Characteristic": dbus.ObjectPath(self.chrc.path), "UUID": self.uuid,
+                            "Flags": dbus.Array(["read"], signature="s")}}
+
+    @dbus.service.method(DBUS_PROP, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return self.props()[GATT_DESC]
+
+    @dbus.service.method(GATT_DESC, in_signature="a{sv}", out_signature="ay")
+    def ReadValue(self, options):
+        return ay(self.value)
+
+
+class Advertisement(dbus.service.Object):
+    def __init__(self, bus, name):
+        self.name = name
+        super().__init__(bus, AD_PATH)
+
+    @dbus.service.method(DBUS_PROP, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        return {"Type": "peripheral",
+                "ServiceUUIDs": dbus.Array(["1812"], signature="s"),
+                "Appearance": dbus.UInt16(0x03C2),  # HID mouse
+                "Includes": dbus.Array(["local-name"], signature="s"),
+                "Discoverable": dbus.Boolean(True)}
+
+    @dbus.service.method(AD_IFACE)
+    def Release(self):
+        log("advertisement released by BlueZ")
+
+
+def device_paired(bus, path):
+    if not path:
+        return False
+    try:
+        props = dbus.Interface(bus.get_object(BLUEZ, path), DBUS_PROP)
+        return bool(props.Get(DEVICE, "Paired")) or bool(props.Get(DEVICE, "Bonded"))
+    except dbus.exceptions.DBusException:
+        return False
+
+
+class Agent(dbus.service.Object):
+    """Pairing agent: only says yes while a pairing window (`airglass pair`) is open."""
+
+    def __init__(self, bus, hid):
+        self.hid = hid
+        super().__init__(bus, AGENT_PATH)
+
+    def _check(self, device):
+        log("agent request from", device, "pairing window open" if self.hid.pairing else "pairing window closed")
+        if not self.hid.pairing:
+            raise Rejected("pairing window closed")
+        dbus.Interface(self.hid.bus.get_object(BLUEZ, device), DBUS_PROP).Set(DEVICE, "Trusted", True)
+
+    @dbus.service.method(AGENT_IFACE)
+    def Release(self):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature="os")
+    def AuthorizeService(self, device, uuid):
+        if not device_paired(self.hid.bus, device):
+            self._check(device)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        raise Rejected("no PIN pairing")
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        raise Rejected("no passkey pairing")
+
+    @dbus.service.method(AGENT_IFACE, in_signature="ouq")
+    def DisplayPasskey(self, device, passkey, entered):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature="os")
+    def DisplayPinCode(self, device, pincode):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature="ou")
+    def RequestConfirmation(self, device, passkey):
+        self._check(device)
+        notify("Pairing phone", "Code %06d: tap Pair on the phone if it shows the same code" % passkey)
+
+    @dbus.service.method(AGENT_IFACE, in_signature="o")
+    def RequestAuthorization(self, device):
+        self._check(device)
+
+    @dbus.service.method(AGENT_IFACE)
+    def Cancel(self):
+        log("agent: pairing cancelled")
+
+
+# --------------------------------------------------------------------------- input
+EVIOCSMASK = (1 << 30) | (16 << 16) | (ord("E") << 8) | 0x93
+
+
+def set_rel_mask(dev, wanted):
+    """Kernel-side filter: while idle we don't want a wakeup per mouse move (8 kHz mice)."""
+    import ctypes
+    # The kernel wants the bitmap size in whole longs (EINVAL otherwise).
+    codes = (ctypes.c_uint8 * 8)(*([0xFF] * 8 if wanted else [0] * 8))
+    arg = struct.pack("IIQ", E.EV_REL, 8, ctypes.addressof(codes))
+    try:
+        fcntl.ioctl(dev.fd, EVIOCSMASK, arg)
+    except OSError as e:
+        log("EVIOCSMASK failed on", dev.path, e)
+
+
+def hypr_query(cmd):
+    run = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    paths = []
+    if sig:
+        paths.append(os.path.join(run, "hypr", sig, ".socket.sock"))
+    try:
+        dirs = sorted((os.path.join(run, "hypr", d) for d in os.listdir(os.path.join(run, "hypr"))),
+                      key=lambda p: os.path.getmtime(p), reverse=True)
+        paths += [os.path.join(d, ".socket.sock") for d in dirs]
+    except OSError:
+        pass
+    for p in paths:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(p)
+                s.sendall(cmd.encode())
+                buf = b""
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            return json.loads(buf or b"null")
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+class Hid:
+    def __init__(self, bus, adapter_path):
+        self.bus, self.adapter_path = bus, adapter_path
+        self.adapter_props = dbus.Interface(bus.get_object(BLUEZ, adapter_path), DBUS_PROP)
+        self.devices = {}  # path -> (InputDevice, watch id)
+        self.captured = False
+        self.pairing = False
+        self.pair_timer = None
+        self.flush_timer = None
+        self.check_timer = None
+        self.ready_seen = False
+        self.last_hint = 0.0
+        self.release_key = getattr(E, CFG["RELEASE_KEY"], E.KEY_RIGHTCTRL)
+        self.sens = float(CFG["SENSITIVITY"])
+        self.scroll = -1 if yes(CFG["SCROLL_INVERT"]) else 1
+        self.interval = max(1, int(CFG["REPORT_INTERVAL_MS"]))
+        self.mirror_re = re.compile(CFG["MIRROR_CLASS"])
+        self.reset_state()
+        self.build_gatt()
+
+    def reset_state(self):
+        self.buttons, self.dx, self.dy, self.wheel, self.pan = 0, 0.0, 0.0, 0, 0
+        self.mods, self.keys, self.mouse_dirty = 0, [], False
+        self.stats = {"motion": 0, "sent": 0}
+
+    # ---- GATT ------------------------------------------------------------
+    def build_gatt(self):
+        self.app = Application(self.bus)
+        hid = Service(self.app, "1812")
+        Characteristic(hid, "2a4a", ["read"], bytes([0x11, 0x01, 0x00, 0x02]))      # HID Information
+        Characteristic(hid, "2a4b", ["encrypt-read"], REPORT_MAP)                    # Report Map
+        Characteristic(hid, "2a4c", ["write-without-response"])                     # HID Control Point
+        Characteristic(hid, "2a4e", ["read", "write-without-response"], b"\x01")   # Protocol Mode: report
+        self.kbd = Characteristic(hid, "2a4d", ["encrypt-read", "notify"], bytes(8), notify=True,
+                                  on_change=self.on_link)
+        Descriptor(self.kbd, "2908", [REPORT_KEYBOARD, 1])
+        led = Characteristic(hid, "2a4d", ["encrypt-read", "encrypt-write", "write-without-response"], b"\x00")
+        Descriptor(led, "2908", [REPORT_KEYBOARD, 2])
+        self.mouse = Characteristic(hid, "2a4d", ["encrypt-read", "notify"], bytes(7), notify=True,
+                                    on_change=self.on_link)
+        Descriptor(self.mouse, "2908", [REPORT_MOUSE, 1])
+        self.consumer = Characteristic(hid, "2a4d", ["encrypt-read", "notify"], bytes(2), notify=True,
+                                       on_change=self.on_link)
+        Descriptor(self.consumer, "2908", [REPORT_CONSUMER, 1])
+        battery = Service(self.app, "180f")
+        Characteristic(battery, "2a19", ["read"], b"\x64")
+        info = Service(self.app, "180a")
+        Characteristic(info, "2a29", ["read"], b"airglass")
+        Characteristic(info, "2a50", ["read"], bytes([0x02, 0x6B, 0x1D, 0x46, 0x02, 0x01, 0x00]))  # PnP ID (USB, 1d6b:0246)
+
+    def register(self):
+        name = str(self.adapter_props.Get(ADAPTER, "Alias"))
+        self.adv = Advertisement(self.bus, name)
+        self.agent = Agent(self.bus, self)
+        adapter = self.bus.get_object(BLUEZ, self.adapter_path)
+        dbus.Interface(adapter, GATT_MANAGER).RegisterApplication(
+            APP_PATH, {}, reply_handler=lambda: log("GATT HID service registered"),
+            error_handler=lambda e: fatal("GATT registration failed: %s" % e))
+        dbus.Interface(adapter, AD_MANAGER).RegisterAdvertisement(
+            AD_PATH, {}, reply_handler=lambda: log("advertising as", repr(name)),
+            error_handler=lambda e: fatal("advertising failed: %s" % e))
+        self.bus.add_signal_receiver(self.on_device_props, dbus_interface=DBUS_PROP,
+                                     signal_name="PropertiesChanged", arg0=DEVICE, path_keyword="path")
+
+    def on_device_props(self, iface, changed, invalidated, path=None):
+        if self.pairing and changed.get("Paired") and str(path).startswith(self.adapter_path):
+            try:
+                name = dbus.Interface(self.bus.get_object(BLUEZ, path), DBUS_PROP).Get(DEVICE, "Alias")
+            except dbus.exceptions.DBusException:
+                name = "phone"
+            notify("Paired with %s" % name, "Click inside the mirror window to control it. %s gives it back."
+                   % key_label(self.release_key))
+            self.end_pairing()
+
+    # ---- pairing window ----------------------------------------------------
+    def start_pairing(self):
+        if self.pairing:
+            return
+        self.pairing = True
+        self.was_pairable = bool(self.adapter_props.Get(ADAPTER, "Pairable"))
+        self.adapter_props.Set(ADAPTER, "Pairable", True)
+        mgr = dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"), AGENT_MANAGER)
+        try:
+            mgr.RegisterAgent(AGENT_PATH, "DisplayYesNo")
+            mgr.RequestDefaultAgent(AGENT_PATH)
+        except dbus.exceptions.DBusException as e:
+            log("agent:", e)
+        name = str(self.adapter_props.Get(ADAPTER, "Alias"))
+        notify("Pair your phone (%ds)" % PAIR_SECONDS,
+               "Phone: Settings → Bluetooth → tap \"%s\" under Other Devices. "
+               "Turn on Accessibility → Touch → AssistiveTouch for the pointer." % name)
+        self.pair_timer = GLib.timeout_add_seconds(PAIR_SECONDS, self.end_pairing)
+        log("pairing window open for %d s" % PAIR_SECONDS)
+        self.write_state()
+
+    def end_pairing(self):
+        if not self.pairing:
+            return False
+        log("pairing window closed")
+        self.pairing = False
+        if self.pair_timer:
+            GLib.source_remove(self.pair_timer)
+            self.pair_timer = None
+        try:
+            self.adapter_props.Set(ADAPTER, "Pairable", self.was_pairable)
+            dbus.Interface(self.bus.get_object(BLUEZ, "/org/bluez"), AGENT_MANAGER).UnregisterAgent(AGENT_PATH)
+        except dbus.exceptions.DBusException as e:
+            log("end pairing:", e)
+        self.write_state()
+        return False
+
+    # ---- link state --------------------------------------------------------
+    def phone_ready(self):
+        return self.mouse.subscribed()
+
+    def on_link(self):
+        ready = self.phone_ready()
+        if ready and not self.ready_seen:
+            log("phone subscribed to HID reports")
+        if not ready and self.captured:
+            self.release()
+            notify("Phone disconnected", "Your mouse and keyboard are back.")
+        self.ready_seen = ready
+        self.write_state()
+        return False
+
+    def write_state(self):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = os.path.join(STATE_DIR, "control.tmp")
+            with open(tmp, "w") as f:
+                f.write("phone=%s\ncaptured=%s\npairing=%s\n" % (
+                    "connected" if self.phone_ready() else "none",
+                    "yes" if self.captured else "no", "yes" if self.pairing else "no"))
+            os.replace(tmp, os.path.join(STATE_DIR, "control"))
+        except OSError:
+            pass
+
+    # ---- input devices -----------------------------------------------------
+    def scan(self):
+        present = set()
+        for path in evdev.list_devices():
+            present.add(path)
+            if path in self.devices:
+                continue
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue
+            caps = dev.capabilities()
+            rel = E.REL_X in caps.get(E.EV_REL, [])
+            keys = caps.get(E.EV_KEY, [])
+            # Physical mice/keyboards only: virtual devices (uinput, ydotool, KVM tools) have no phys.
+            if not dev.phys or not (rel or E.KEY_A in keys or E.BTN_LEFT in keys):
+                dev.close()
+                continue
+            set_rel_mask(dev, self.captured)
+            if self.captured:
+                try:
+                    dev.grab()
+                except OSError:
+                    pass
+            watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_HIGH, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                                      self.on_input, path)
+            self.devices[path] = (dev, watch)
+        for path in list(self.devices):
+            if path not in present:
+                self.forget(path)
+        return True
+
+    def forget(self, path):
+        dev, watch = self.devices.pop(path)
+        GLib.source_remove(watch)
+        try:
+            dev.close()
+        except OSError:
+            pass
+
+    def on_input(self, fd, cond, path):
+        entry = self.devices.get(path)
+        if not entry:
+            return False
+        dev = entry[0]
+        if cond & (GLib.IO_HUP | GLib.IO_ERR):
+            self.devices.pop(path, None)
+            dev.close()
+            return False
+        try:
+            for ev in dev.read():
+                self.on_event(ev)
+        except BlockingIOError:
+            pass
+        except OSError:
+            self.devices.pop(path, None)
+            dev.close()
+            return False
+        return True
+
+    def on_event(self, ev):
+        t, code, val = ev.type, ev.code, ev.value
+        if not self.captured:
+            # Idle: only watch for "click inside the mirror window" / the release key as a toggle.
+            if t == E.EV_KEY and val == 0 and code in (E.BTN_LEFT, self.release_key):
+                self.maybe_capture(click=(code == E.BTN_LEFT))
+            return
+        if t == E.EV_REL:
+            self.stats["motion"] += 1
+            if code == E.REL_X:
+                self.dx += val * self.sens
+            elif code == E.REL_Y:
+                self.dy += val * self.sens
+            elif code == E.REL_WHEEL:
+                self.wheel += val * self.scroll
+            elif code == E.REL_HWHEEL:
+                self.pan += val * self.scroll
+        elif t == E.EV_KEY:
+            if code == self.release_key:
+                if val == 0:
+                    self.release()
+                return
+            if val == 2:
+                return  # the phone does its own key repeat
+            if code in BUTTONS:
+                self.buttons = (self.buttons | BUTTONS[code]) if val else (self.buttons & ~BUTTONS[code])
+                self.mouse_dirty = True
+            elif code in MODIFIERS:
+                self.mods = (self.mods | MODIFIERS[code]) if val else (self.mods & ~MODIFIERS[code])
+                self.send_keyboard()
+            elif code in KEYMAP:
+                usage = KEYMAP[code]
+                if val and usage not in self.keys:
+                    self.keys.append(usage)
+                elif not val and usage in self.keys:
+                    self.keys.remove(usage)
+                self.send_keyboard()
+            elif code in CONSUMER:
+                self.consumer.send(struct.pack("<H", CONSUMER[code] if val else 0))
+        elif t == E.EV_SYN and code == E.SYN_REPORT and self.mouse_dirty:
+            self.flush_mouse()  # button changes go out at once; motion is batched by the timer
+
+    def send_keyboard(self):
+        keys = self.keys[-6:]
+        self.kbd.send(bytes([self.mods, 0] + keys + [0] * (6 - len(keys))))
+
+    def flush_mouse(self):
+        dx = max(-32767, min(32767, int(self.dx)))
+        dy = max(-32767, min(32767, int(self.dy)))
+        wheel = max(-127, min(127, self.wheel))
+        pan = max(-127, min(127, self.pan))
+        if not (dx or dy or wheel or pan or self.mouse_dirty):
+            return True
+        self.dx -= dx
+        self.dy -= dy
+        self.wheel -= wheel
+        self.pan -= pan
+        self.mouse_dirty = False
+        self.mouse.send(struct.pack("<Bhhbb", self.buttons, dx, dy, wheel, pan))
+        self.stats["sent"] += 1
+        return True
+
+    # ---- capture -----------------------------------------------------------
+    def mirror_focused(self, click):
+        win = hypr_query("j/activewindow")
+        if not win or not self.mirror_re.search(win.get("class", "")):
+            return False
+        if not click:
+            return True
+        pos = hypr_query("j/cursorpos") or {}
+        (x, y), (w, h) = win.get("at", (0, 0)), win.get("size", (0, 0))
+        return x <= pos.get("x", -1) < x + w and y <= pos.get("y", -1) < y + h
+
+    def maybe_capture(self, click):
+        if not self.mirror_focused(click):
+            return
+        if not self.phone_ready():
+            if time.monotonic() - self.last_hint > 30:
+                self.last_hint = time.monotonic()
+                notify("Phone not connected for control",
+                       "Run `airglass pair` once, or check the phone's Bluetooth is on.")
+            return
+        self.capture()
+
+    def capture(self):
+        self.scan()
+        self.reset_state()
+        self.captured = True
+        for dev, _ in self.devices.values():
+            set_rel_mask(dev, True)
+            try:
+                dev.grab()
+            except OSError as e:
+                log("grab failed", dev.path, e)
+        self.flush_timer = GLib.timeout_add(self.interval, self.flush_mouse)
+        self.check_timer = GLib.timeout_add_seconds(1, self.check_mirror)
+        log("captured %d input devices" % len(self.devices))
+        notify("Controlling the phone", "%s gives your mouse and keyboard back." % key_label(self.release_key),
+               "low")
+        self.write_state()
+
+    def release(self):
+        if not self.captured:
+            return
+        log("released: %d mouse events in, %d mouse reports out (%s), %d dropped" % (
+            self.stats["motion"], self.stats["sent"], "socket" if self.mouse.sock else "D-Bus",
+            self.mouse.dropped))
+        self.captured = False
+        self.reset_state()
+        for ch, size in ((self.mouse, 7), (self.kbd, 8), (self.consumer, 2)):
+            if ch.subscribed():
+                ch.send(bytes(size))  # nothing stays pressed on the phone
+        for dev, _ in self.devices.values():
+            try:
+                dev.ungrab()
+            except OSError:
+                pass
+            set_rel_mask(dev, False)
+        for attr in ("flush_timer", "check_timer"):
+            if getattr(self, attr):
+                GLib.source_remove(getattr(self, attr))
+                setattr(self, attr, None)
+        self.write_state()
+
+    def check_mirror(self):
+        if self.captured and not self.mirror_focused(click=False):
+            self.release()
+            return False
+        return self.captured
+
+
+def key_label(code):
+    name = E.KEY.get(code, "release key")
+    if isinstance(name, (list, tuple)):
+        name = name[0]
+    return name.replace("KEY_", "").replace("RIGHT", "RIGHT ").title()
+
+
+def fatal(msg):
+    log(msg)
+    notify("airglass control failed", msg, "critical")
+    global EXIT_CODE
+    EXIT_CODE = 1
+    LOOP.quit()
+
+
+def sd_notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+    except OSError:
+        pass
+
+
+def find_adapter(bus):
+    objs = dbus.Interface(bus.get_object(BLUEZ, "/"), DBUS_OM).GetManagedObjects()
+    for path, ifaces in objs.items():
+        if GATT_MANAGER in ifaces and AD_MANAGER in ifaces:
+            return path
+    return None
+
+
+LOOP = GLib.MainLoop()
+EXIT_CODE = 0
+
+
+def main():
+    if not yes(CFG["CONTROL"]):
+        log("CONTROL=no in config: not starting")
+        return 0
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    adapter = find_adapter(bus)
+    if not adapter:
+        log("no Bluetooth adapter with LE peripheral support")
+        return 1
+    props = dbus.Interface(bus.get_object(BLUEZ, adapter), DBUS_PROP)
+    if not props.Get(ADAPTER, "Powered"):
+        props.Set(ADAPTER, "Powered", True)
+    hid = Hid(bus, adapter)
+    hid.register()
+    hid.scan()
+    hid.write_state()
+    GLib.timeout_add_seconds(5, hid.scan)  # hotplugged mice/keyboards
+
+    def stop():
+        hid.release()
+        hid.end_pairing()
+        LOOP.quit()
+        return False
+
+    signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, stop)
+    signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, stop)
+    signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1, lambda: (hid.start_pairing(), True)[1])
+    sd_notify("READY=1")
+    # Watchdog: if the loop ever hangs while input is grabbed, systemd kills us and the
+    # kernel drops the grab, so a stuck daemon can never keep your keyboard.
+    GLib.timeout_add_seconds(2, lambda: (sd_notify("WATCHDOG=1"), True)[1])
+    LOOP.run()
+    try:
+        os.remove(os.path.join(STATE_DIR, "control"))
+    except OSError:
+        pass
+    return EXIT_CODE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

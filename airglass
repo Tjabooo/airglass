@@ -4,11 +4,12 @@
 # a systemd user service, desktop notifications and a state file for bars.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CONFIG="${AIRGLASS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/airglass/config}"
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/airglass"
 STATE_FILE="$STATE_DIR/state"
 UNIT="airglass.service"
+HID_UNIT="airglass-hid.service"
 
 # ---- defaults (override in $CONFIG) --------------------------------------
 NAME="$(hostname 2>/dev/null || cat /etc/hostname)"
@@ -26,6 +27,7 @@ NOTIFY="yes"
 ON_CHANGE=""             # shell command run after every state change (e.g. signal your bar)
 UXPLAY="uxplay"
 EXTRA_ARGS=""
+CONTROL="yes"            # yes = control the phone with this mouse/keyboard (Bluetooth, see airglass-hid)
 
 load_config() {
     [[ -f "$CONFIG" ]] || return 0
@@ -37,7 +39,7 @@ load_config() {
         value="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$value")"
         value="${value#\"}"; value="${value%\"}"
         case "$key" in
-            NAME|RESOLUTION|FPS|DECODER|VIDEOSINK|AUDIOSINK|AV_SYNC|FULLSCREEN|KEEP_WINDOW|PIN|TAKEOVER|NOTIFY|ON_CHANGE|UXPLAY|EXTRA_ARGS)
+            NAME|RESOLUTION|FPS|DECODER|VIDEOSINK|AUDIOSINK|AV_SYNC|FULLSCREEN|KEEP_WINDOW|PIN|TAKEOVER|NOTIFY|ON_CHANGE|UXPLAY|EXTRA_ARGS|CONTROL|RELEASE_KEY|SENSITIVITY|SCROLL_INVERT|REPORT_INTERVAL_MS|MIRROR_CLASS)
                 printf -v "$key" '%s' "$value" ;;
             *) echo "airglass: unknown config key '$key' in $CONFIG" >&2 ;;
         esac
@@ -102,25 +104,35 @@ notify() {
     notify-send -a airglass -i video-display -h string:x-dunst-stack-tag:airglass "$1" "${2:-}" >/dev/null 2>&1 || true
 }
 
-cmd_run() {
-    command -v "$UXPLAY" >/dev/null || { echo "airglass: '$UXPLAY' not found (install UxPlay)" >&2; exit 1; }
-    build_args
-    trap 'set_state off' EXIT
-    trap 'exit 0' TERM INT
-    set_state listening
-    notify "AirPlay ready" "Mirror to \"$NAME\" from Control Center → Screen Mirroring"
-    # Line-buffer UxPlay's log so state changes show up the moment they happen.
-    stdbuf -oL -eL "$UXPLAY" "${ARGS[@]}" 2>&1 | while IFS= read -r line; do
+watch_log() {
+    local line
+    while IFS= read -r line; do
         printf '%s\n' "$line"
         case "$line" in
             *"starting mirroring"*)
-                set_state mirroring; notify "Mirroring" "Phone connected to \"$NAME\"" ;;
+                set_state mirroring; notify "Mirroring" "Phone connected to \"$NAME\"$(control_hint)" ;;
             *"running is no longer true"*|*"lost connection with client"*)
                 set_state listening; notify "Mirroring stopped" "Still listening as \"$NAME\"" ;;
             *"Requested TCP port"*"not available"*|*"failed to"*"socket"*)
                 notify "AirPlay could not start" "$line" ;;
         esac
     done
+}
+
+control_hint() {
+    is_yes "$CONTROL" || return 0
+    grep -q '^phone=connected' "$STATE_DIR/control" 2>/dev/null && printf '. Click the window to control it'
+}
+
+cmd_run() {
+    command -v "$UXPLAY" >/dev/null || { echo "airglass: '$UXPLAY' not found (install UxPlay)" >&2; exit 1; }
+    build_args
+    set_state listening
+    notify "AirPlay ready" "Mirror to \"$NAME\" from Control Center → Screen Mirroring"
+    # UxPlay replaces this shell (systemd signals it directly); its line-buffered log
+    # feeds watch_log, which tracks the state. ExecStopPost writes "off".
+    exec > >(watch_log) 2>&1
+    exec stdbuf -oL -eL "$UXPLAY" "${ARGS[@]}"
 }
 
 cmd_doctor() {
@@ -133,6 +145,12 @@ cmd_doctor() {
     check "hardware decoder (vah264dec)" "have_element vah264dec"           "install gst-plugin-va (Arch) / gstreamer1.0-plugins-bad (Debian)"
     check "AAC decoder (avdec_aac)"  "have_element avdec_aac"               "install gst-libav (audio from the phone needs it)"
     check "audio sink"               "have_element pulsesink || have_element pipewiresink" "install gst-plugins-good or gst-plugin-pipewire"
+    if is_yes "$CONTROL"; then
+        check "Bluetooth adapter powered" "bluetoothctl show | grep -q 'Powered: yes'" "bluetoothctl power on"
+        check "LE peripheral role" "bluetoothctl show | grep -q 'Roles: peripheral'" "adapter can't act as a mouse/keyboard"
+        check "python evdev + dbus + gi" "python3 -c 'import evdev, dbus, gi'" "install python-evdev python-dbus python-gobject"
+        check "read access to /dev/input" "[ -r \"\$(ls /dev/input/event* | head -1)\" ]" "sudo usermod -aG input \$USER (then log in again)"
+    fi
     check "video sink"               "have_element waylandsink || have_element glimagesink" "install gst-plugins-bad / gst-plugins-base"
     if command -v ufw >/dev/null && systemctl is-active --quiet ufw; then
         echo "  note  ufw is active: the phone must reach mDNS + AirPlay ports. Run once:"
@@ -155,6 +173,8 @@ airglass $VERSION: AirPlay screen mirroring receiver (UxPlay engine)
   airglass start|stop|restart|status
   airglass run        run in the foreground (what the service runs)
   airglass state      print off / listening / mirroring
+  airglass pair       let a phone pair as mouse/keyboard target (120 s window)
+  airglass control    phone link + capture state
   airglass doctor     check dependencies + firewall, print the UxPlay command
   airglass logs       follow the service log
 
@@ -173,9 +193,15 @@ main() {
             if systemctl --user is-active --quiet "$UNIT"; then
                 systemctl --user stop "$UNIT"; notify "AirPlay off" ""
             else systemctl --user start "$UNIT"; fi ;;
-        status)   systemctl --user --no-pager status "$UNIT" ;;
+        status)   systemctl --user --no-pager status "$UNIT" "$HID_UNIT" ;;
+        pair)
+            systemctl --user is-active --quiet "$HID_UNIT" || systemctl --user start "$UNIT"
+            sleep 1
+            systemctl --user kill -s USR1 "$HID_UNIT"
+            echo "Pairing open for 120 s: phone → Settings → Bluetooth → tap \"$NAME\" under Other Devices" ;;
+        control)  cat "$STATE_DIR/control" 2>/dev/null || echo "control off" ;;
         state)    cat "$STATE_FILE" 2>/dev/null || echo off ;;
-        logs)     journalctl --user -u "$UNIT" -f -n 50 ;;
+        logs)     journalctl --user -u "$UNIT" -u "$HID_UNIT" -f -n 50 ;;
         doctor)   cmd_doctor ;;
         version|--version) echo "airglass $VERSION" ;;
         help|-h|--help) usage ;;

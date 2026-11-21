@@ -31,3 +31,12 @@ NOTIFY=yes
 
 # Anything else UxPlay understands (see man uxplay)
 #EXTRA_ARGS=-h265
+
+# ---- phone control (Bluetooth mouse + keyboard; pair once with `airglass pair`) ----
+CONTROL=yes
+# evdev key name that gives your mouse/keyboard back
+RELEASE_KEY=KEY_RIGHTCTRL
+SENSITIVITY=1.0
+SCROLL_INVERT=no
+REPORT_INTERVAL_MS=8
+#MIRROR_CLASS=^(uxplay|airglass)$
