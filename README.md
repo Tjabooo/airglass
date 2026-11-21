@@ -98,6 +98,7 @@ How it behaves:
 | `VIDEOSINK` | `auto` | `waylandsink` on Wayland, else `glimagesink` |
 | `AUDIOSINK` | `auto` | `pulsesink` > `pipewiresink` > `autoaudiosink`; `0` = no audio |
 | `AV_SYNC` | `no` | `yes` holds video back for lip sync (adds latency) |
+| `AUDIO_BUFFER_MS` | `60` | With `AV_SYNC=no`: most audio allowed to queue before old audio is dropped |
 | `FULLSCREEN` | `no` | Open the mirror window fullscreen |
 | `KEEP_WINDOW` | `no` | Keep the window after the phone stops |
 | `TAKEOVER` | `yes` | A new phone may take over |

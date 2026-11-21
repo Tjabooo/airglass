@@ -19,6 +19,8 @@ AUDIOSINK=auto
 # no = show each frame as soon as it is decoded (lowest latency, audio may drift a little)
 # yes = hold video back to keep lip sync
 AV_SYNC=no
+# With AV_SYNC=no: most audio (ms) allowed to queue; older audio is dropped so it never drifts behind
+AUDIO_BUFFER_MS=60
 
 FULLSCREEN=no
 KEEP_WINDOW=no

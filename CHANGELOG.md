@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.1 (2026-11-21)
+
+- Fix audio drifting further and further behind after pausing, seeking or scrolling (low-latency mode): a leaky 60 ms queue (`AUDIO_BUFFER_MS`) drops stale audio instead of letting it pile up.
+
 ## v0.2.0 (2026-11-21)
 
 - Control the phone with the computer's mouse and keyboard: `airglass-hid` acts as a Bluetooth LE HID device; click the mirror window to take control, Right Ctrl to release.

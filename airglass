@@ -4,7 +4,7 @@
 # a systemd user service, desktop notifications and a state file for bars.
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 CONFIG="${AIRGLASS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/airglass/config}"
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/airglass"
 STATE_FILE="$STATE_DIR/state"
@@ -19,6 +19,7 @@ DECODER="auto"           # auto | vah264dec | vulkanh264dec | avdec_h264 | any G
 VIDEOSINK="auto"         # auto | waylandsink | glimagesink | ximagesink | ...
 AUDIOSINK="auto"         # auto | pipewiresink | pulsesink | autoaudiosink | 0 (no audio)
 AV_SYNC="no"             # no = show every frame the moment it is decoded (lowest latency)
+AUDIO_BUFFER_MS="60"     # with AV_SYNC=no: most audio kept queued; older audio is dropped so delay never builds up
 FULLSCREEN="no"
 KEEP_WINDOW="no"         # yes = keep the window open after the phone stops mirroring
 PIN=""                   # 4 digits = ask for this PIN on first connect
@@ -39,7 +40,7 @@ load_config() {
         value="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$value")"
         value="${value#\"}"; value="${value%\"}"
         case "$key" in
-            NAME|RESOLUTION|FPS|DECODER|VIDEOSINK|AUDIOSINK|AV_SYNC|FULLSCREEN|KEEP_WINDOW|PIN|TAKEOVER|NOTIFY|ON_CHANGE|UXPLAY|EXTRA_ARGS|CONTROL|RELEASE_KEY|SENSITIVITY|SCROLL_INVERT|REPORT_INTERVAL_MS|MIRROR_CLASS)
+            NAME|RESOLUTION|FPS|DECODER|VIDEOSINK|AUDIOSINK|AV_SYNC|FULLSCREEN|KEEP_WINDOW|PIN|TAKEOVER|NOTIFY|ON_CHANGE|UXPLAY|EXTRA_ARGS|AUDIO_BUFFER_MS|CONTROL|RELEASE_KEY|SENSITIVITY|SCROLL_INVERT|REPORT_INTERVAL_MS|MIRROR_CLASS)
                 printf -v "$key" '%s' "$value" ;;
             *) echo "airglass: unknown config key '$key' in $CONFIG" >&2 ;;
         esac
@@ -81,7 +82,16 @@ build_args() {
           -vd "$decoder" -vc videoconvert -vs "$vsink")
     # videoconvert/videoscale pass DMA-BUF frames through untouched when the
     # decoder and sink agree, so the VA-API path stays zero-copy.
-    if [[ "$asink" == "0" ]]; then ARGS+=(-a); else ARGS+=(-as "$asink"); fi
+    if [[ "$asink" == "0" ]]; then ARGS+=(-a)
+    elif is_yes "$AV_SYNC"; then ARGS+=(-as "$asink")
+    else
+        # Unsynced audio (-vsync no) has no timestamps, so every burst the phone sends
+        # (resume, seek, app switch) would queue up for good. A leaky queue in front of a
+        # small sink buffer drops the oldest audio instead, so the delay stays bounded.
+        local ms="${AUDIO_BUFFER_MS:-60}" sinkopts=""
+        [[ "$asink" == pulsesink ]] && sinkopts=" buffer-time=$((ms * 1000)) latency-time=10000"
+        ARGS+=(-as "queue leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time=$((ms * 1000000)) ! ${asink}${sinkopts}")
+    fi
     is_yes "$AV_SYNC" || ARGS+=(-vsync no)
     is_yes "$FULLSCREEN" && ARGS+=(-fs)
     is_yes "$KEEP_WINDOW" && ARGS+=(-nc)
