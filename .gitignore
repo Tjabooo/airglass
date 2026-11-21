@@ -1,0 +1,9 @@
+# Editors / OS / local
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+.env
+.env.*
+*.log

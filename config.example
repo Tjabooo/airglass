@@ -1,0 +1,33 @@
+# airglass config: copy to ~/.config/airglass/config
+# KEY=value, one per line. Restart after editing: airglass restart
+
+# Name the iPhone shows under Screen Mirroring (default: hostname)
+#NAME=My PC
+
+# Largest picture the phone is asked to send; it keeps its own aspect ratio.
+# Use your monitor's resolution for the sharpest picture.
+RESOLUTION=1920x1080
+FPS=60
+
+# auto picks: vah264dec (VA-API, zero-copy) > nvh264dec > v4l2h264dec > avdec_h264
+DECODER=auto
+# auto picks waylandsink on Wayland, else glimagesink
+VIDEOSINK=auto
+# auto picks pulsesink > pipewiresink > autoaudiosink; 0 = no audio
+AUDIOSINK=auto
+
+# no = show each frame as soon as it is decoded (lowest latency, audio may drift a little)
+# yes = hold video back to keep lip sync
+AV_SYNC=no
+
+FULLSCREEN=no
+KEEP_WINDOW=no
+TAKEOVER=yes
+#PIN=1234
+NOTIFY=yes
+
+# Run after every state change; $AIRGLASS_STATE is off / listening / mirroring
+#ON_CHANGE=pkill -RTMIN+16 waybar
+
+# Anything else UxPlay understands (see man uxplay)
+#EXTRA_ARGS=-h265

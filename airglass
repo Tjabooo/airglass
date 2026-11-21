@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# airglass: low-latency AirPlay screen mirroring receiver for Linux desktops.
+# Wraps UxPlay (the AirPlay protocol engine) with a tuned GStreamer pipeline,
+# a systemd user service, desktop notifications and a state file for bars.
+set -euo pipefail
+
+VERSION="0.1.0"
+CONFIG="${AIRGLASS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/airglass/config}"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/airglass"
+STATE_FILE="$STATE_DIR/state"
+UNIT="airglass.service"
+
+# ---- defaults (override in $CONFIG) --------------------------------------
+NAME="$(hostname 2>/dev/null || cat /etc/hostname)"
+RESOLUTION="1920x1080"   # max size the phone is asked to send (it keeps its aspect ratio)
+FPS="60"
+DECODER="auto"           # auto | vah264dec | vulkanh264dec | avdec_h264 | any GStreamer element
+VIDEOSINK="auto"         # auto | waylandsink | glimagesink | ximagesink | ...
+AUDIOSINK="auto"         # auto | pipewiresink | pulsesink | autoaudiosink | 0 (no audio)
+AV_SYNC="no"             # no = show every frame the moment it is decoded (lowest latency)
+FULLSCREEN="no"
+KEEP_WINDOW="no"         # yes = keep the window open after the phone stops mirroring
+PIN=""                   # 4 digits = ask for this PIN on first connect
+TAKEOVER="yes"           # a new phone may take over from the current one
+NOTIFY="yes"
+ON_CHANGE=""             # shell command run after every state change (e.g. signal your bar)
+UXPLAY="uxplay"
+EXTRA_ARGS=""
+
+load_config() {
+    [[ -f "$CONFIG" ]] || return 0
+    local key value
+    while IFS='=' read -r key value; do
+        key="${key//[[:space:]]/}"
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        value="${value%%#*}"                          # strip trailing comments
+        value="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$value")"
+        value="${value#\"}"; value="${value%\"}"
+        case "$key" in
+            NAME|RESOLUTION|FPS|DECODER|VIDEOSINK|AUDIOSINK|AV_SYNC|FULLSCREEN|KEEP_WINDOW|PIN|TAKEOVER|NOTIFY|ON_CHANGE|UXPLAY|EXTRA_ARGS)
+                printf -v "$key" '%s' "$value" ;;
+            *) echo "airglass: unknown config key '$key' in $CONFIG" >&2 ;;
+        esac
+    done <"$CONFIG"
+}
+
+have_element() { gst-inspect-1.0 --exists "$1" 2>/dev/null; }
+
+pick_decoder() {
+    [[ "$DECODER" != "auto" ]] && { echo "$DECODER"; return; }
+    # VA-API first: it hands DMA-BUFs straight to waylandsink (no copies).
+    for d in vah264dec nvh264dec v4l2h264dec avdec_h264; do
+        have_element "$d" && { echo "$d"; return; }
+    done
+    echo "decodebin"
+}
+
+pick_videosink() {
+    [[ "$VIDEOSINK" != "auto" ]] && { echo "$VIDEOSINK"; return; }
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]] && have_element waylandsink; then echo waylandsink
+    elif have_element glimagesink; then echo glimagesink
+    else echo autovideosink; fi
+}
+
+pick_audiosink() {
+    [[ "$AUDIOSINK" != "auto" ]] && { echo "$AUDIOSINK"; return; }
+    for s in pulsesink pipewiresink autoaudiosink; do
+        have_element "$s" && { echo "$s"; return; }
+    done
+    echo 0
+}
+
+is_yes() { [[ "${1,,}" =~ ^(yes|true|on|1)$ ]]; }
+
+build_args() {
+    local decoder vsink asink
+    decoder="$(pick_decoder)"; vsink="$(pick_videosink)"; asink="$(pick_audiosink)"
+    ARGS=(-n "$NAME" -nh -s "${RESOLUTION}@${FPS}" -fps "$FPS" -p
+          -vd "$decoder" -vc videoconvert -vs "$vsink")
+    # videoconvert/videoscale pass DMA-BUF frames through untouched when the
+    # decoder and sink agree, so the VA-API path stays zero-copy.
+    if [[ "$asink" == "0" ]]; then ARGS+=(-a); else ARGS+=(-as "$asink"); fi
+    is_yes "$AV_SYNC" || ARGS+=(-vsync no)
+    is_yes "$FULLSCREEN" && ARGS+=(-fs)
+    is_yes "$KEEP_WINDOW" && ARGS+=(-nc)
+    is_yes "$TAKEOVER" && ARGS+=(-nohold)
+    [[ -n "$PIN" ]] && ARGS+=("-pin" "$PIN")
+    if [[ -n "$EXTRA_ARGS" ]]; then
+        local extra; read -r -a extra <<<"$EXTRA_ARGS"; ARGS+=("${extra[@]}")
+    fi
+}
+
+set_state() {
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$1" >"$STATE_FILE.tmp" && mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+    if [[ -n "$ON_CHANGE" ]]; then AIRGLASS_STATE="$1" sh -c "$ON_CHANGE" >/dev/null 2>&1 || true; fi
+}
+
+notify() {
+    is_yes "$NOTIFY" || return 0
+    command -v notify-send >/dev/null || return 0
+    notify-send -a airglass -i video-display -h string:x-dunst-stack-tag:airglass "$1" "${2:-}" >/dev/null 2>&1 || true
+}
+
+cmd_run() {
+    command -v "$UXPLAY" >/dev/null || { echo "airglass: '$UXPLAY' not found (install UxPlay)" >&2; exit 1; }
+    build_args
+    trap 'set_state off' EXIT
+    trap 'exit 0' TERM INT
+    set_state listening
+    notify "AirPlay ready" "Mirror to \"$NAME\" from Control Center → Screen Mirroring"
+    # Line-buffer UxPlay's log so state changes show up the moment they happen.
+    stdbuf -oL -eL "$UXPLAY" "${ARGS[@]}" 2>&1 | while IFS= read -r line; do
+        printf '%s\n' "$line"
+        case "$line" in
+            *"starting mirroring"*)
+                set_state mirroring; notify "Mirroring" "Phone connected to \"$NAME\"" ;;
+            *"running is no longer true"*|*"lost connection with client"*)
+                set_state listening; notify "Mirroring stopped" "Still listening as \"$NAME\"" ;;
+            *"Requested TCP port"*"not available"*|*"failed to"*"socket"*)
+                notify "AirPlay could not start" "$line" ;;
+        esac
+    done
+}
+
+cmd_doctor() {
+    local ok=0
+    check() { if eval "$2" >/dev/null 2>&1; then printf '  ok    %s\n' "$1"; else printf '  FAIL  %s  → %s\n' "$1" "$3"; ok=1; fi; }
+    echo "airglass $VERSION doctor"
+    check "uxplay installed"        "command -v '$UXPLAY'"                 "install UxPlay (Arch: yay -S uxplay)"
+    check "avahi-daemon running"     "systemctl is-active --quiet avahi-daemon" "sudo systemctl enable --now avahi-daemon"
+    check "H.264 parser (h264parse)" "have_element h264parse"               "install gst-plugins-bad"
+    check "hardware decoder (vah264dec)" "have_element vah264dec"           "install gst-plugin-va (Arch) / gstreamer1.0-plugins-bad (Debian)"
+    check "AAC decoder (avdec_aac)"  "have_element avdec_aac"               "install gst-libav (audio from the phone needs it)"
+    check "audio sink"               "have_element pulsesink || have_element pipewiresink" "install gst-plugins-good or gst-plugin-pipewire"
+    check "video sink"               "have_element waylandsink || have_element glimagesink" "install gst-plugins-bad / gst-plugins-base"
+    if command -v ufw >/dev/null && systemctl is-active --quiet ufw; then
+        echo "  note  ufw is active: the phone must reach mDNS + AirPlay ports. Run once:"
+        local net; net="$(ip -4 route show scope link 2>/dev/null | awk '!/wg|tun|docker|virbr/ {print $1; exit}')"
+        echo "        sudo ufw allow from ${net:-<your-lan>/24} to any port 5353 proto udp comment airglass"
+        echo "        sudo ufw allow from ${net:-<your-lan>/24} to any port 7000,7001,7100 proto tcp comment airglass"
+        echo "        sudo ufw allow from ${net:-<your-lan>/24} to any port 6000,6001,7011 proto udp comment airglass"
+    fi
+    load_config; build_args
+    echo "  pipeline: decoder=$(pick_decoder) video=$(pick_videosink) audio=$(pick_audiosink)"
+    printf '  command:  %s' "$UXPLAY"; printf ' %q' "${ARGS[@]}"; echo
+    return $ok
+}
+
+usage() {
+    cat <<EOF
+airglass $VERSION: AirPlay screen mirroring receiver (UxPlay engine)
+
+  airglass toggle     start or stop the receiver (systemd user service)
+  airglass start|stop|restart|status
+  airglass run        run in the foreground (what the service runs)
+  airglass state      print off / listening / mirroring
+  airglass doctor     check dependencies + firewall, print the UxPlay command
+  airglass logs       follow the service log
+
+Config: $CONFIG
+EOF
+}
+
+main() {
+    load_config
+    case "${1:-help}" in
+        run)      cmd_run ;;
+        start)    systemctl --user start "$UNIT" ;;
+        stop)     systemctl --user stop "$UNIT" ;;
+        restart)  systemctl --user restart "$UNIT" ;;
+        toggle)
+            if systemctl --user is-active --quiet "$UNIT"; then
+                systemctl --user stop "$UNIT"; notify "AirPlay off" ""
+            else systemctl --user start "$UNIT"; fi ;;
+        status)   systemctl --user --no-pager status "$UNIT" ;;
+        state)    cat "$STATE_FILE" 2>/dev/null || echo off ;;
+        logs)     journalctl --user -u "$UNIT" -f -n 50 ;;
+        doctor)   cmd_doctor ;;
+        version|--version) echo "airglass $VERSION" ;;
+        help|-h|--help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

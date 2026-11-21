@@ -1,0 +1,14 @@
+[Unit]
+Description=airglass AirPlay mirroring receiver
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BIN@ run
+Restart=on-failure
+RestartSec=2
+ExecStopPost=/bin/sh -c 'echo off > "$XDG_RUNTIME_DIR/airglass/state" 2>/dev/null || true'
+
+[Install]
+WantedBy=graphical-session.target
