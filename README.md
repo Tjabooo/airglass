@@ -4,6 +4,8 @@
 
 Mirror your iPhone or iPad to a Linux desktop over AirPlay, tuned for the lowest latency your hardware can do, and control it with your computer's mouse and keyboard.
 
+![An iPhone mirrored to a Linux desktop and controlled with the desktop's mouse](docs/demo.gif)
+
 airglass is a small launcher around [UxPlay](https://github.com/FDH2/UxPlay), the open-source AirPlay mirroring server. UxPlay speaks the AirPlay protocol; airglass picks the fastest GStreamer pipeline for your machine, runs it as a systemd user service, and tells you (and your status bar) when a phone connects.
 
 ## Features
